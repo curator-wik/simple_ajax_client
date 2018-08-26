@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Simple Ajax Client for Curator</title>
+    <script src="./jquery.js"></script>
+
+    <script>
+        $(document).ready(function(){
+            startClient();
+        });
+
+        var endpoint = 'http://localhost/sites/all/modules/curator/drupal_curator.php/api/v1/';
+
+        function startClient() {
+            $.get(endpoint + 'status')
+                .done(function(data) {
+                    if (! data.is_authenticated) {
+                        alert('Session not authenticated.');
+                    } else {
+                        var batchPromise = initBatchRun();
+                        batchPromise.then(cleanupClient);
+                    }
+                });
+        }
+
+        function cleanupClient(taskCompleteResult) {
+            if (taskCompleteResult.noMoreTasks) {
+                writeOutput(-1, 'All tasks have been completed!');
+                window.setTimeout(function() {
+                    window.location.href = '/update.php';
+                }, 1500);
+            } else {
+                batchPromise = initBatchRun({
+                    runnerIds: taskCompleteResult.nextTaskRunnerIds,
+                    numRunners: taskCompleteResult.numRunners,
+                    friendlyName: taskCompleteResult.friendlyName,
+                });
+                batchPromise.then(cleanupClient);
+            }
+        }
+
+        function initBatchRun(taskInfo = null) {
+            var batchClient = new BatchClient();
+            if (taskInfo == null) {
+                // We can always get the parameters for running the current task properly from the server.
+                $.get(endpoint + 'batch/current-task')
+                    .done(function(batchTaskInfo) {
+                        batchClient.run(batchTaskInfo);
+                    })
+                    .fail(function(data, status) {
+                        alert('Current-task response data: ' + data + ". Status: " + status);
+                        batchClient.promise.resolve({'noMoreTasks': true});
+                    });
+            } else {
+                // .. but info for the next task is sent with task completion, so we might not need to call for it.
+                batchClient.run(taskInfo);
+            }
+
+            return batchClient.promise;
+        }
+
+        // Constructor for a BatchClient object.
+        function BatchClient() {
+            this.promise = $.Deferred();
+            this.clientNumber = BatchClient.nextClientNumber++;
+        }
+        // This is in internal client number, not the task id on the server that the client is running.
+        BatchClient.nextClientNumber = 1;
+
+        BatchClient.prototype.run = function(batchTaskInfo) {
+            this.incompleteRunnerIds = batchTaskInfo.runnerIds;
+            this.waitingToStartRunners = [];
+            this.numRunners = batchTaskInfo.numRunners;
+
+            writeOutput(this.clientNumber, batchTaskInfo.friendlyName);
+
+            for (var i = 0; i <  this.incompleteRunnerIds.length; i++) {
+                var runner = new BatchRunner(this, this.incompleteRunnerIds[i]);
+                if (i >= this.numRunners) {
+                    this.waitingToStartRunners.push(runner);
+                } else {
+                    runner.runMore();
+                }
+            }
+        }
+
+        // Constructor for a specific runner.
+        function BatchRunner(client, id) {
+            this.client = client;
+            this.id = id;
+        }
+        BatchRunner.prototype.runMore = function() {
+            // Run this runner again as long as it's still incomplete.
+            if (this.client.incompleteRunnerIds.indexOf(this.id) != -1) {
+                $.ajax(endpoint + 'batch/runner', {
+                    'method': 'POST',
+                    'headers': {'X-Runner-Id': this.id},
+                    'success': BatchRunner.complete.bind(this),
+                    'timeout': 0,
+                    'xhr': function(){
+                        var xhr = jQuery.ajaxSettings.xhr();
+                        xhr.onreadystatechange = function() {
+                            if (xhr.readyState === 3) {
+                                console.debug(xhr.responseText);
+                            }
+                        };
+                        return xhr;
+                    },
+                });
+            }
+        }
+        BatchRunner.complete = function(result) {
+            // This client not fancy enough to do streaming response processing;
+            // just ignore all types but 0 (TYPE_CONTROL), which tell us to keep the runners going on this task,
+            // and type 2 (TYPE_RESPONSE), which includes incomplete_runner_ids for the next task.
+            for (var i = 0; i < result.length; i++) {
+                var batchMessage = result[i];
+                switch (batchMessage.type) {
+                    case 0:
+                        this.client.incompleteRunnerIds = batchMessage.incomplete_runner_ids;
+                        if (this.client.incompleteRunnerIds.indexOf(this.id) != -1) {
+                            this.runMore();
+                        } else {
+                            // This runner is done; check if we've got others waiting.
+                            if (this.client.waitingToStartRunners.length) {
+                                this.client.waitingToStartRunners.shift().runMore();
+                            }
+                        }
+                        break;
+                    case 2:
+                        this.client.promise.resolve({
+                            'noMoreTasks': batchMessage.incomplete_runner_ids.length == 0,
+                            'nextTaskRunnerIds': batchMessage.incomplete_runner_ids,
+                            'numRunners': batchMessage.num_runners,
+                            'friendlyName': batchMessage.friendlyName,
+                        });
+                        break;
+                }
+            }
+        }
+
+        function writeOutput(id, message) {
+            var elem = $('runner_' + id);
+            if (elem.length) {
+                elem.text(message);
+            } else {
+                elem = $('<p></p>');
+                elem.text(message);
+                $('#output').append(elem);
+            }
+        }
+    </script>
+</head>
+<body>
+    <h1>Curator super-simple client</h1>
+    <div style="font-family: monospace" id="output"></div>
+</body>
+</html>
