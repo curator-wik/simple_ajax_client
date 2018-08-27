@@ -11,6 +11,7 @@
         });
 
         var endpoint = 'http://localhost/sites/all/modules/curator/drupal_curator.php/api/v1/';
+        var globalTaskGroup = new TaskGroup();
 
         function startClient() {
             $.get(endpoint + 'status')
@@ -31,11 +32,11 @@
                     window.location.href = '/update.php';
                 }, 1500);
             } else {
-                batchPromise = initBatchRun({
-                    runnerIds: taskCompleteResult.nextTaskRunnerIds,
-                    numRunners: taskCompleteResult.numRunners,
-                    friendlyName: taskCompleteResult.friendlyName,
-                });
+                var batchClient = this;
+                globalTaskGroup.onTaskComplete(taskCompleteResult, batchClient);
+                var taskInfo = taskCompleteResult;
+                taskInfo.runnerIds = taskInfo.nextTaskRunnerIds; // name disagreements...
+                batchPromise = initBatchRun(taskInfo);
                 batchPromise.then(cleanupClient);
             }
         }
@@ -46,11 +47,12 @@
                 // We can always get the parameters for running the current task properly from the server.
                 $.get(endpoint + 'batch/current-task')
                     .done(function(batchTaskInfo) {
+                        globalTaskGroup.onTaskComplete(batchTaskInfo, batchClient);
                         batchClient.run(batchTaskInfo);
                     })
                     .fail(function(data, status) {
                         alert('Current-task response data: ' + data + ". Status: " + status);
-                        batchClient.promise.resolve({'noMoreTasks': true});
+                        batchClient.promise.resolveWith(batchClient, [{'noMoreTasks': true}]);
                     });
             } else {
                 // .. but info for the next task is sent with task completion, so we might not need to call for it.
@@ -60,18 +62,57 @@
             return batchClient.promise;
         }
 
+        // Constructor for a TaskGroup object.
+        // TaskGroups are only of interest to clients in that they can't project percent completion beyond
+        // the realm of the current group, so this is the abstraction that computes the "most overall" percent
+        // completion we can show / resets it to 0 if a new task group starts running.
+        function TaskGroup() {
+            this.currTaskGroup = 0;
+            this.numTasks = 0;
+            this.taskCompletePcts = {};
+        }
+        TaskGroup.prototype.onTaskComplete = function(taskCompletionInfo, batchClient) {
+            if (this.currTaskGroup != taskCompletionInfo.taskGroupId) {
+                // New task group. We need to start everything over.
+                this.currTaskGroup = taskCompletionInfo.taskGroupId;
+                this.numTasks = taskCompletionInfo.numTasksInGroup;
+                this.taskCompletePcts = {};
+                this.recomputeOverallPct();
+            } else {
+                // If the task is complete, it is inferred that it is 100% complete.
+                this.onTaskProgress(100, batchClient);
+            }
+        }
+        TaskGroup.prototype.onTaskProgress = function(newPercentage, batchClient) {
+            this.taskCompletePcts[batchClient.clientNumber] = newPercentage;
+            this.recomputeOverallPct();
+        }
+        TaskGroup.prototype.recomputeOverallPct = function() {
+            var totalPct = 0;
+            for (var taskPct in this.taskCompletePcts) {
+                totalPct += this.taskCompletePcts[taskPct];
+            }
+            totalPct = totalPct / this.numTasks;
+
+            $('#pct').text(totalPct + "%");
+        }
+
         // Constructor for a BatchClient object.
+        // A BatchClient sees one task to completion using one or more BatchRunners.
         function BatchClient() {
             this.promise = $.Deferred();
             this.clientNumber = BatchClient.nextClientNumber++;
+            this.numCompletedRunnables = 0;
+            this.taskCompletePct = 0;
         }
-        // This is in internal client number, not the task id on the server that the client is running.
+        // This is an internal client number, not the task id on the server that the client is running.
         BatchClient.nextClientNumber = 1;
 
         BatchClient.prototype.run = function(batchTaskInfo) {
             this.incompleteRunnerIds = batchTaskInfo.runnerIds;
             this.waitingToStartRunners = [];
             this.numRunners = batchTaskInfo.numRunners;
+            this.numRunnables = batchTaskInfo.numRunnables;
 
             writeOutput(this.clientNumber, batchTaskInfo.friendlyName);
 
@@ -111,9 +152,14 @@
             }
         }
         BatchRunner.complete = function(result) {
-            // This client not fancy enough to do streaming response processing;
-            // just ignore all types but 0 (TYPE_CONTROL), which tell us to keep the runners going on this task,
-            // and type 2 (TYPE_RESPONSE), which includes incomplete_runner_ids for the next task.
+            // This client not fancy enough to do streaming response processing.
+            // Message types:
+            // 0: TYPE_CONTROL. Sent at end of runner's work when there are more runnables to do.
+            // 1: TYPE_UPDATE.  Sent in chunks as runner works, one for each runnable. Tells us how
+            //                  many runnables have completed, whether there was an error with the
+            //                  runnable, and misc. chatter that every runnable can output at us.
+            // 2: TYPE_RESPONSE Sent at end of overall task. Includes information to initialize a
+            //                  BatchClient for the next task, as well as the overall result of the task.
             for (var i = 0; i < result.length; i++) {
                 var batchMessage = result[i];
                 switch (batchMessage.type) {
@@ -128,24 +174,39 @@
                             }
                         }
                         break;
+                    case 1:
+                        // Maybe move to a function of this.client?
+                        if (batchMessage.hasOwnProperty('n')) {
+                            this.client.numCompletedRunnables++;
+                            this.client.taskCompletePct = Math.min((this.client.numCompletedRunnables / this.client.numRunnables) * 100, 100);
+                        } else if (batchMessage.hasOwnProperty('pct')) {
+                            this.client.taskCompletePct = Math.min(batchMessage.pct, 100);
+                        }
+
+                        writeOutput(this.client.clientNumber, this.client.taskCompletePct + '%');
+                        globalTaskGroup.onTaskProgress(this.client.taskCompletePct, this.client);
+                        break;
                     case 2:
-                        this.client.promise.resolve({
+                        this.client.promise.resolveWith(this.client, [{
                             'noMoreTasks': batchMessage.incomplete_runner_ids.length == 0,
                             'nextTaskRunnerIds': batchMessage.incomplete_runner_ids,
                             'numRunners': batchMessage.num_runners,
+                            'numRunnables': batchMessage.numRunnables,
                             'friendlyName': batchMessage.friendlyName,
-                        });
+                            'taskGroupId': batchMessage.taskGroupId,
+                            'numTasksInGroup': batchMessage.numTasksInGroup,
+                        }]);
                         break;
                 }
             }
         }
 
         function writeOutput(id, message) {
-            var elem = $('runner_' + id);
+            var elem = $('#runner_' + id);
             if (elem.length) {
                 elem.text(message);
             } else {
-                elem = $('<p></p>');
+                elem = $('<p id="runner_' + id + '"></p>');
                 elem.text(message);
                 $('#output').append(elem);
             }
@@ -154,6 +215,7 @@
 </head>
 <body>
     <h1>Curator super-simple client</h1>
+    <div style="float: right;" id="pct">0%</div>
     <div style="font-family: monospace" id="output"></div>
 </body>
 </html>
